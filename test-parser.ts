@@ -4,7 +4,7 @@
  */
 
 import * as fs from 'fs';
-import { NetTraceParser } from './src/nettraceParser';
+import { NetTraceFullParser } from './src/nettraceParser';
 
 const filePath = process.argv[2] || '/Users/sebastienros/tmp/dotnet_20251129_162608.nettrace';
 
@@ -18,7 +18,7 @@ console.log(`File size: ${fs.statSync(filePath).size} bytes`);
 console.log('---');
 
 const buffer = fs.readFileSync(filePath);
-const parser = new NetTraceParser(buffer, true); // Enable debug mode
+const parser = new NetTraceFullParser(buffer, true); // Enable debug mode
 const result = parser.parse();
 
 console.log('\n=== RESULTS ===');
@@ -48,6 +48,21 @@ if (result.allocations.size > 0) {
     console.log('\nTop 20 allocations by size:');
     for (const alloc of sorted) {
         console.log(`  ${alloc.typeName}: ${alloc.count} allocations, ${alloc.totalSize} bytes`);
+    }
+}
+
+console.log(`\nMethods: ${result.methods.size}`);
+console.log(`Method Profiles: ${result.methodProfiles.size}`);
+
+if (result.methodProfiles.size > 0) {
+    // Sort by exclusive count descending
+    const sorted = Array.from(result.methodProfiles.values())
+        .sort((a, b) => b.exclusiveCount - a.exclusiveCount)
+        .slice(0, 20);
+    
+    console.log('\nTop 20 methods by exclusive samples:');
+    for (const profile of sorted) {
+        console.log(`  ${profile.methodName}: excl=${profile.exclusiveCount}, incl=${profile.inclusiveCount}`);
     }
 }
 
