@@ -101,11 +101,17 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             }
 
             allocationsHtml = sortedAllocations.map((alloc, index) => `
-                <tr class="allocation-row" data-index="${index}">
-                    <td class="type-name">${escapeHtml(alloc.typeName)}</td>
+                <tr class="allocation-row" data-index="${index}" data-type="${escapeHtml(alloc.typeName)}">
+                    <td class="type-name">
+                        <span class="expand-btn" onclick="toggleStackDistribution(${index}, event)">▶</span>
+                        ${escapeHtml(alloc.typeName)}
+                    </td>
                     <td class="count">${alloc.count.toLocaleString()}</td>
                     <td class="size">${formatBytes(alloc.totalSize)}</td>
                     <td class="avg-size">${formatBytes(alloc.count > 0 ? alloc.totalSize / BigInt(alloc.count) : BigInt(0))}</td>
+                </tr>
+                <tr class="stack-distribution-row" id="stack-dist-${index}" style="display: none;">
+                    <td colspan="4" class="stack-distribution-cell"></td>
                 </tr>
             `).join('');
         }
@@ -149,8 +155,14 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
         const sortedProviders = Array.from(providerStats.entries())
             .sort((a, b) => b[1].total - a[1].total);
 
-        // Prepare flame graph data
-        const flameGraphData = this.buildFlameGraphData(result);
+        // Prepare flame graph data for both CPU and Allocations
+        const cpuFlameGraphData = this.buildFlameGraphData(result, 'cpu');
+        const allocFlameGraphData = this.buildFlameGraphData(result, 'allocation');
+        const hasCpuData = cpuFlameGraphData.length > 0;
+        const hasAllocData = allocFlameGraphData.length > 0;
+
+        // Prepare type stack distribution with resolved method names
+        const typeStackData = this.buildTypeStackDistribution(result);
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -276,17 +288,28 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
         .info-item { display: flex; gap: 10px; }
         .info-label { font-weight: 600; opacity: 0.8; }
 
-        .search-box {
+        .search-box, select {
             padding: 8px 12px;
             border: 1px solid var(--border-color);
             border-radius: 4px;
             background: var(--bg-color);
             color: var(--text-color);
             font-size: 0.9em;
-            width: 250px;
         }
 
-        .search-box:focus { outline: 1px solid var(--accent-color); border-color: var(--accent-color); }
+        .search-box { width: 250px; }
+        
+        select {
+            cursor: pointer;
+            min-width: 150px;
+        }
+        
+        select:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .search-box:focus, select:focus { outline: 1px solid var(--accent-color); border-color: var(--accent-color); }
 
         .table-container {
             overflow-x: auto;
@@ -315,6 +338,58 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             word-break: break-all;
             max-width: 500px;
         }
+
+        .expand-btn {
+            cursor: pointer;
+            display: inline-block;
+            width: 16px;
+            margin-right: 4px;
+            transition: transform 0.2s;
+            opacity: 0.7;
+        }
+        .expand-btn:hover { opacity: 1; }
+        .expand-btn.expanded { transform: rotate(90deg); }
+
+        .stack-distribution-row { background: var(--header-bg); }
+        .stack-distribution-cell { padding: 0 !important; }
+        .stack-distribution-content {
+            padding: 12px 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .stack-dist-item {
+            display: flex;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+        }
+        .stack-dist-item:hover { background: var(--hover-bg); }
+        .stack-dist-item:last-child { border-bottom: none; }
+        .stack-dist-stats {
+            min-width: 180px;
+            text-align: right;
+            opacity: 0.8;
+            font-size: 12px;
+        }
+        .stack-dist-frames {
+            flex: 1;
+            font-family: var(--vscode-editor-font-family);
+            font-size: 12px;
+        }
+        .stack-frame { padding: 2px 0; }
+        .stack-frame.top { font-weight: 600; }
+        .stack-preview { 
+            color: var(--vscode-textLink-foreground); 
+            flex: 1;
+            font-family: var(--vscode-editor-font-family);
+        }
+        .stack-expanded-frames {
+            margin-top: 8px;
+            padding-left: 20px;
+            border-left: 2px solid var(--border-color);
+            display: none;
+        }
+        .stack-expanded-frames.visible { display: block; }
 
         .method-name { font-size: 0.85em; max-width: 600px; }
 
@@ -377,11 +452,13 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             border: 1px solid var(--border-color);
             border-radius: 6px;
             background: var(--header-bg);
+            padding-top: 32px;
         }
 
         .flame-graph {
             min-width: 100%;
             min-height: 400px;
+            position: relative;
         }
 
         .flame-node {
@@ -403,6 +480,23 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             z-index: 10;
         }
 
+        .flame-reset-btn {
+            position: absolute;
+            top: -28px;
+            left: 0;
+            padding: 4px 10px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            z-index: 100;
+        }
+        .flame-reset-btn:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+
         .flame-tooltip {
             position: fixed;
             background: var(--vscode-editorWidget-background);
@@ -411,13 +505,81 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             padding: 8px 12px;
             font-size: 12px;
             z-index: 1000;
-            pointer-events: none;
             max-width: 500px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.3);
         }
 
         .flame-tooltip .method { font-weight: 600; margin-bottom: 4px; word-break: break-all; }
         .flame-tooltip .stats { opacity: 0.8; }
+        .flame-tooltip .details-btn {
+            margin-top: 8px;
+            padding: 4px 8px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .flame-tooltip .details-btn:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+
+        /* Type distribution modal */
+        .type-modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+        .type-modal-overlay.visible { display: flex; }
+        .type-modal {
+            background: var(--vscode-editorWidget-background);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .type-modal-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .type-modal-header h3 { margin: 0; font-size: 14px; }
+        .type-modal-close {
+            background: none;
+            border: none;
+            color: var(--text-color);
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0 4px;
+        }
+        .type-modal-close:hover { opacity: 0.7; }
+        .type-modal-content {
+            padding: 16px;
+            overflow-y: auto;
+            max-height: 60vh;
+        }
+        .type-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .type-item:last-child { border-bottom: none; }
+        .type-name { font-family: var(--vscode-editor-font-family); flex: 1; word-break: break-all; }
+        .type-stats { text-align: right; min-width: 150px; opacity: 0.8; font-size: 12px; }
 
         /* Stack view styles */
         .stack-list { max-height: 600px; overflow-y: auto; }
@@ -453,6 +615,61 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             margin-left: 10px;
         }
         .stack-frame:hover { background: var(--hover-bg); }
+
+        /* Help icon tooltip */
+        .help-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            font-size: 12px;
+            font-weight: 600;
+            cursor: help;
+            margin-left: 8px;
+            position: relative;
+        }
+        .help-icon:hover .help-tooltip {
+            display: block;
+        }
+        .help-tooltip {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            margin-top: 8px;
+            padding: 12px 16px;
+            background: var(--vscode-editorWidget-background);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: normal;
+            line-height: 1.5;
+            width: 320px;
+            max-width: 90vw;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 1000;
+            text-align: left;
+            white-space: normal;
+        }
+        .help-tooltip::before {
+            content: '';
+            position: absolute;
+            top: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-bottom: 6px solid var(--border-color);
+        }
+        .section-header h2 {
+            display: flex;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
@@ -552,7 +769,11 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
         ${sortedProfiles.length > 0 ? `
         <div class="section">
             <div class="section-header">
-                <h2>Hot Methods (Top 20)</h2>
+                <h2>Hot Methods (Top 20)
+                    <span class="help-icon">?
+                        <span class="help-tooltip">Methods that consumed the most CPU time during profiling. These are the top candidates for optimization. The count shows how many times each method appeared in CPU samples.</span>
+                    </span>
+                </h2>
             </div>
             <div class="table-container">
                 <table>
@@ -581,7 +802,11 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
     <!-- Allocations Tab -->
     <div id="tab-allocations" class="tab-content">
         <div class="section-header">
-            <h2>Object Allocations</h2>
+            <h2>Object Allocations
+                <span class="help-icon">?
+                    <span class="help-tooltip">Shows all object allocations captured during the trace. Each row represents a .NET type that was allocated, with the total count and memory size. Use this to identify which types consume the most memory and are allocated most frequently. Sort by size to find memory-heavy allocations.</span>
+                </span>
+            </h2>
             <input type="text" class="search-box" id="searchBox" placeholder="Filter by type name..." oninput="filterTable()">
         </div>
         
@@ -627,7 +852,11 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
     <!-- Stacks Tab -->
     <div id="tab-stacks" class="tab-content">
         <div class="section-header">
-            <h2>CPU Profiling</h2>
+            <h2>CPU Profiling
+                <span class="help-icon">?
+                    <span class="help-tooltip">Shows CPU time spent in each method. <strong>Exclusive</strong> time is spent directly in the method. <strong>Inclusive</strong> time includes time spent in methods it calls. High exclusive time indicates the method itself is slow. High inclusive time with low exclusive suggests called methods are slow.</span>
+                </span>
+            </h2>
             <input type="text" class="search-box" id="methodSearchBox" placeholder="Filter by method name..." oninput="filterMethodTable()">
         </div>
         
@@ -669,17 +898,42 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
 
     <!-- Flame Graph Tab -->
     <div id="tab-flamegraph" class="tab-content">
-        <h2>Flame Graph</h2>
-        ${flameGraphData.length > 0 ? `
-        <p class="subtitle">Click on a frame to zoom in. Click outside to reset.</p>
+        <div class="section-header">
+            <h2>Flame Graph
+                <span class="help-icon" id="flameGraphHelp">?
+                    <span class="help-tooltip" id="flameGraphHelpText">${hasCpuData ? 
+                        'Visualizes where CPU time is spent across call stacks. Width represents time: wider bars indicate more CPU usage. Stacks grow upward—the bottom shows entry points, each layer above shows called methods. If an upper layer is narrower than its parent, the difference represents exclusive time spent in the parent method itself.' :
+                        'Visualizes where memory is allocated across call stacks. Width represents allocation size: wider bars indicate more memory. Stacks grow upward—the bottom shows entry points, each layer above shows called methods. If an upper layer is narrower than its parent, the difference represents memory allocated directly by the parent method itself.'}</span>
+                </span>
+            </h2>
+            ${(hasCpuData || hasAllocData) ? `
+            <select id="flameGraphMode" onchange="switchFlameGraphMode()">
+                <option value="cpu" ${hasCpuData ? '' : 'disabled'}>CPU Samples${hasCpuData ? '' : ' (no data)'}</option>
+                <option value="allocation" ${hasAllocData ? '' : 'disabled'}>Allocations${hasAllocData ? '' : ' (no data)'}</option>
+            </select>
+            ` : ''}
+        </div>
+        ${(hasCpuData || hasAllocData) ? `
+        <p class="subtitle" id="flameGraphSubtitle">
+            ${hasCpuData ? 'Showing CPU samples. Hover for details. Double-click to zoom.' : 'Showing memory allocations. Hover for details. Double-click to zoom.'}
+        </p>
         <div class="flame-graph-container">
             <div id="flameGraph" class="flame-graph" style="position: relative;"></div>
         </div>
         <div id="flameTooltip" class="flame-tooltip" style="display: none;"></div>
+        <div id="typeModalOverlay" class="type-modal-overlay">
+            <div class="type-modal">
+                <div class="type-modal-header">
+                    <h3 id="typeModalTitle">Allocation Types</h3>
+                    <button class="type-modal-close" onclick="closeTypeModal()">&times;</button>
+                </div>
+                <div id="typeModalContent" class="type-modal-content"></div>
+            </div>
+        </div>
         ` : `
         <div class="no-data">
             <p>No stack data available for flame graph.</p>
-            <p>Make sure the trace includes SampleProfiler events with stack traces.</p>
+            <p>Make sure the trace includes SampleProfiler or GC allocation events with stack traces.</p>
         </div>
         `}
     </div>
@@ -702,7 +956,17 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             inclusiveTimeMs: p.inclusiveTimeMs
         })))};
 
-        const flameGraphData = ${JSON.stringify(flameGraphData)};
+        // Type stack distribution: typeName -> array of stacks with frames
+        const typeStackDistribution = ${JSON.stringify(Object.fromEntries(
+            Array.from(typeStackData.entries()).map(([typeName, stacks]) => [
+                typeName,
+                stacks.slice(0, 50) // Limit to top 50 stacks per type
+            ])
+        ))};
+
+        const cpuFlameGraphData = ${JSON.stringify(cpuFlameGraphData)};
+        const allocFlameGraphData = ${JSON.stringify(allocFlameGraphData)};
+        let currentFlameGraphMode = '${hasCpuData ? 'cpu' : (hasAllocData ? 'allocation' : 'cpu')}';
 
         let currentSort = { column: 'size', descending: true };
         let currentMethodSort = { column: 'exclusive', descending: true };
@@ -715,21 +979,49 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             document.querySelector(\`.tab[onclick="switchTab('\${tabId}')"]\`).classList.add('active');
             document.getElementById('tab-' + tabId).classList.add('active');
 
-            if (tabId === 'flamegraph' && flameGraphData.length > 0) {
+            if (tabId === 'flamegraph') {
                 renderFlameGraph();
             }
+        }
+
+        function switchFlameGraphMode() {
+            const select = document.getElementById('flameGraphMode');
+            currentFlameGraphMode = select.value;
+            flameGraphFocusNode = null; // Reset zoom when switching modes
+            const subtitle = document.getElementById('flameGraphSubtitle');
+            if (subtitle) {
+                subtitle.textContent = currentFlameGraphMode === 'cpu' 
+                    ? 'Showing CPU samples. Hover for details. Double-click to zoom.'
+                    : 'Showing memory allocations. Hover for details. Double-click to zoom.';
+            }
+            // Update help tooltip text
+            const helpText = document.getElementById('flameGraphHelpText');
+            if (helpText) {
+                helpText.textContent = currentFlameGraphMode === 'cpu'
+                    ? 'Visualizes where CPU time is spent across call stacks. Width represents time: wider bars indicate more CPU usage. Stacks grow upward—the bottom shows entry points, each layer above shows called methods. If an upper layer is narrower than its parent, the difference represents exclusive time spent in the parent method itself. Double-click a node to zoom in.'
+                    : 'Visualizes where memory is allocated across call stacks. Width represents allocation size: wider bars indicate more memory. Stacks grow upward—the bottom shows entry points, each layer above shows called methods. If an upper layer is narrower than its parent, the difference represents memory allocated directly by the parent method itself. Double-click a node to zoom in.';
+            }
+            renderFlameGraph();
         }
 
         function filterTable() {
             const searchBox = document.getElementById('searchBox');
             if (!searchBox) return;
             const searchTerm = searchBox.value.toLowerCase();
-            const rows = document.querySelectorAll('#allocationsBody tr');
+            const allocationRows = document.querySelectorAll('#allocationsBody .allocation-row');
             
-            rows.forEach((row, index) => {
+            allocationRows.forEach((row) => {
+                const index = parseInt(row.dataset.index, 10);
                 if (allocations[index]) {
                     const typeName = allocations[index].typeName.toLowerCase();
-                    row.classList.toggle('hidden', !typeName.includes(searchTerm));
+                    const shouldHide = !typeName.includes(searchTerm);
+                    row.classList.toggle('hidden', shouldHide);
+                    // Also hide the corresponding stack distribution row
+                    const distRow = document.getElementById('stack-dist-' + index);
+                    if (distRow && shouldHide) {
+                        distRow.style.display = 'none';
+                        row.querySelector('.expand-btn')?.classList.remove('expanded');
+                    }
                 }
             });
         }
@@ -759,14 +1051,87 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             const tbody = document.getElementById('allocationsBody');
             if (tbody) {
                 tbody.innerHTML = sorted.map((alloc, index) => \`
-                    <tr class="allocation-row" data-index="\${index}">
-                        <td class="type-name">\${escapeHtml(alloc.typeName)}</td>
+                    <tr class="allocation-row" data-index="\${index}" data-type="\${escapeHtml(alloc.typeName)}">
+                        <td class="type-name">
+                            <span class="expand-btn" onclick="toggleStackDistribution(\${index}, event)">▶</span>
+                            \${escapeHtml(alloc.typeName)}
+                        </td>
                         <td class="count">\${Number(alloc.count).toLocaleString()}</td>
                         <td class="size">\${formatBytes(BigInt(alloc.totalSize))}</td>
                         <td class="avg-size">\${formatBytes(BigInt(alloc.avgSize))}</td>
                     </tr>
+                    <tr class="stack-distribution-row" id="stack-dist-\${index}" style="display: none;">
+                        <td colspan="4" class="stack-distribution-cell"></td>
+                    </tr>
                 \`).join('');
                 filterTable();
+            }
+        }
+
+        function toggleStackDistribution(index, event) {
+            event.stopPropagation();
+            const row = document.querySelector(\`.allocation-row[data-index="\${index}"]\`);
+            const distRow = document.getElementById('stack-dist-' + index);
+            const expandBtn = row?.querySelector('.expand-btn');
+            
+            if (!row || !distRow) return;
+            
+            const typeName = row.dataset.type;
+            const isExpanded = distRow.style.display !== 'none';
+            
+            if (isExpanded) {
+                distRow.style.display = 'none';
+                expandBtn?.classList.remove('expanded');
+            } else {
+                // Get stack distribution for this type
+                const stacks = typeStackDistribution[typeName] || [];
+                const cell = distRow.querySelector('.stack-distribution-cell');
+                
+                if (stacks.length === 0) {
+                    cell.innerHTML = '<div class="stack-distribution-content"><em>No stack data available for this type</em></div>';
+                } else {
+                    const totalSize = stacks.reduce((sum, s) => sum + s.size, 0);
+                    const totalCount = stacks.reduce((sum, s) => sum + s.count, 0);
+                    
+                    let html = '<div class="stack-distribution-content">';
+                    html += '<div style="margin-bottom: 8px; opacity: 0.7; font-size: 12px;">' + 
+                            stacks.length + ' unique stacks. Click a stack to expand all frames.</div>';
+                    
+                    stacks.forEach((stack, stackIndex) => {
+                        const sizePct = totalSize > 0 ? ((stack.size / totalSize) * 100).toFixed(1) : '0.0';
+                        const countPct = totalCount > 0 ? ((stack.count / totalCount) * 100).toFixed(1) : '0.0';
+                        const topFrame = stack.frames.length > 0 ? stack.frames[0] : '(unknown)';
+                        
+                        html += \`
+                            <div class="stack-dist-item" onclick="toggleStackFrames(\${index}, \${stackIndex}, event)">
+                                <span class="stack-preview">\${escapeHtml(topFrame)}</span>
+                                <span class="stack-dist-stats">
+                                    \${stack.count.toLocaleString()} (\${countPct}%) • 
+                                    \${formatBytes(stack.size)} (\${sizePct}%)
+                                </span>
+                            </div>
+                            <div class="stack-expanded-frames" id="stack-frames-\${index}-\${stackIndex}">
+                                \${stack.frames.map((frame, i) => 
+                                    '<div class="stack-frame' + (i === 0 ? ' top' : '') + '">' + escapeHtml(frame) + '</div>'
+                                ).join('')}
+                            </div>
+                        \`;
+                    });
+                    
+                    html += '</div>';
+                    cell.innerHTML = html;
+                }
+                
+                distRow.style.display = 'table-row';
+                expandBtn?.classList.add('expanded');
+            }
+        }
+
+        function toggleStackFrames(typeIndex, stackIndex, event) {
+            event.stopPropagation();
+            const framesDiv = document.getElementById('stack-frames-' + typeIndex + '-' + stackIndex);
+            if (framesDiv) {
+                framesDiv.classList.toggle('visible');
             }
         }
 
@@ -854,40 +1219,117 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
 
         // Flame graph rendering
+        let flameGraphFocusNode = null; // Current focused node for zoom
+        
         function renderFlameGraph() {
             const container = document.getElementById('flameGraph');
+            let flameGraphData = currentFlameGraphMode === 'cpu' ? cpuFlameGraphData : allocFlameGraphData;
             if (!container || flameGraphData.length === 0) return;
 
             container.innerHTML = '';
             const width = container.clientWidth || 800;
             const rowHeight = 22;
-            const totalSamples = flameGraphData.reduce((sum, d) => sum + d.samples, 0);
+            const isAllocationMode = currentFlameGraphMode === 'allocation';
+            
+            // Calculate totals from full data
+            const fullTotalSamples = flameGraphData.reduce((sum, d) => sum + d.samples, 0);
+            const fullTotalSize = flameGraphData.reduce((sum, d) => sum + (d.size || 0), 0);
+            
+            // If we have a focused node, filter and rescale the data
+            let viewData = flameGraphData;
+            let focusX = 0;
+            let focusWidth = 1;
+            let focusDepth = 0;
+            
+            if (flameGraphFocusNode) {
+                // Find the focused node
+                const focusedNode = flameGraphData.find(n => 
+                    n.name === flameGraphFocusNode.name && 
+                    n.depth === flameGraphFocusNode.depth &&
+                    Math.abs(n.x - flameGraphFocusNode.x) < 0.0001
+                );
+                
+                if (focusedNode) {
+                    focusX = focusedNode.x;
+                    focusWidth = focusedNode.width;
+                    focusDepth = focusedNode.depth;
+                    
+                    // Filter to nodes within or below the focused node
+                    viewData = flameGraphData.filter(n => {
+                        // Include nodes at same depth or deeper
+                        if (n.depth < focusDepth) return false;
+                        // Include nodes that overlap with the focused area
+                        const nodeEnd = n.x + n.width;
+                        const focusEnd = focusX + focusWidth;
+                        return n.x < focusEnd && nodeEnd > focusX;
+                    });
+                }
+            }
+            
+            // Calculate totals for percentage display (use focused node's samples if zoomed)
+            const totalSamples = flameGraphFocusNode ? 
+                (viewData.find(n => n.depth === focusDepth)?.samples || fullTotalSamples) : 
+                fullTotalSamples;
+            const totalSize = flameGraphFocusNode ?
+                (viewData.find(n => n.depth === focusDepth)?.size || fullTotalSize) :
+                fullTotalSize;
             
             // Group by depth and calculate positions
-            const maxDepth = Math.max(...flameGraphData.map(d => d.depth));
-            const height = (maxDepth + 1) * rowHeight + 20;
+            const maxDepth = Math.max(...viewData.map(d => d.depth));
+            const minDepth = flameGraphFocusNode ? focusDepth : 0;
+            const height = (maxDepth - minDepth + 1) * rowHeight + 20;
             container.style.height = height + 'px';
 
-            // Color palette for flame graph
-            const colors = [
+            // Color palette - use different colors for CPU vs Allocation
+            const cpuColors = [
                 '#f59e0b', '#ef4444', '#8b5cf6', '#3b82f6', '#10b981',
                 '#f97316', '#ec4899', '#6366f1', '#14b8a6', '#84cc16'
             ];
+            const allocColors = [
+                '#10b981', '#14b8a6', '#0ea5e9', '#3b82f6', '#6366f1',
+                '#22c55e', '#06b6d4', '#0284c7', '#2563eb', '#4f46e5'
+            ];
+            const colors = isAllocationMode ? allocColors : cpuColors;
 
-            flameGraphData.forEach((node, index) => {
+            // Add reset button if zoomed
+            if (flameGraphFocusNode) {
+                const resetBtn = document.createElement('button');
+                resetBtn.className = 'flame-reset-btn';
+                resetBtn.textContent = '← Reset Zoom';
+                resetBtn.onclick = () => {
+                    flameGraphFocusNode = null;
+                    renderFlameGraph();
+                };
+                container.appendChild(resetBtn);
+            }
+
+            viewData.forEach((node, index) => {
                 const div = document.createElement('div');
                 div.className = 'flame-node';
-                div.style.left = (node.x * width) + 'px';
-                div.style.width = Math.max(node.width * width - 1, 1) + 'px';
+                
+                // Rescale position if zoomed
+                const scaledX = focusWidth > 0 ? (node.x - focusX) / focusWidth : node.x;
+                const scaledWidth = focusWidth > 0 ? node.width / focusWidth : node.width;
+                
+                div.style.left = (scaledX * width) + 'px';
+                div.style.width = Math.max(scaledWidth * width - 1, 1) + 'px';
                 div.style.top = ((maxDepth - node.depth) * rowHeight) + 'px';
                 div.style.backgroundColor = colors[Math.abs(hashCode(node.name)) % colors.length];
                 div.style.color = '#fff';
-                div.textContent = node.width > 0.02 ? node.name : '';
+                div.textContent = scaledWidth > 0.02 ? node.name : '';
                 div.title = node.name;
 
-                div.addEventListener('mouseenter', (e) => showTooltip(e, node, totalSamples));
-                div.addEventListener('mouseleave', hideTooltip);
+                div.addEventListener('mouseenter', (e) => showTooltip(e, node, totalSamples, totalSize, isAllocationMode));
+                div.addEventListener('mouseleave', scheduleHideTooltip);
                 div.addEventListener('mousemove', moveTooltip);
+                
+                // Double-click to zoom
+                div.addEventListener('dblclick', (e) => {
+                    e.preventDefault();
+                    hideTooltip();
+                    flameGraphFocusNode = { name: node.name, depth: node.depth, x: node.x };
+                    renderFlameGraph();
+                });
 
                 container.appendChild(div);
             });
@@ -902,26 +1344,128 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             return hash;
         }
 
-        function showTooltip(e, node, totalSamples) {
+        let currentTooltipNode = null;
+        let tooltipHideTimeout = null;
+
+        function showTooltip(e, node, totalSamples, totalSize, isAllocationMode) {
+            // Cancel any pending hide
+            if (tooltipHideTimeout) {
+                clearTimeout(tooltipHideTimeout);
+                tooltipHideTimeout = null;
+            }
+            currentTooltipNode = node;
             const tooltip = document.getElementById('flameTooltip');
             const pct = ((node.samples / totalSamples) * 100).toFixed(2);
-            tooltip.innerHTML = \`
-                <div class="method">\${escapeHtml(node.name)}</div>
-                <div class="stats">\${node.samples.toLocaleString()} samples (\${pct}%)</div>
-            \`;
+            if (isAllocationMode && node.size !== undefined) {
+                const sizePct = totalSize > 0 ? ((node.size / totalSize) * 100).toFixed(2) : '0.00';
+                const hasTypes = node.types && node.types.length > 0;
+                tooltip.innerHTML = \`
+                    <div class="method">\${escapeHtml(node.name)}</div>
+                    <div class="stats">\${node.samples.toLocaleString()} allocations (\${pct}%)</div>
+                    <div class="stats">\${formatBytes(node.size)} (\${sizePct}% of total)</div>
+                    \${hasTypes ? '<button class="details-btn" onclick="showTypeDetails(event)">View Type Distribution</button>' : ''}
+                \`;
+            } else {
+                tooltip.innerHTML = \`
+                    <div class="method">\${escapeHtml(node.name)}</div>
+                    <div class="stats">\${node.samples.toLocaleString()} samples (\${pct}%)</div>
+                \`;
+            }
             tooltip.style.display = 'block';
-            moveTooltip(e);
+            // Position tooltip, but ensure it doesn't go off-screen
+            const tooltipRect = tooltip.getBoundingClientRect();
+            let left = e.clientX + 10;
+            let top = e.clientY + 10;
+            
+            // Adjust if tooltip would go off right edge
+            if (left + tooltipRect.width > window.innerWidth - 10) {
+                left = e.clientX - tooltipRect.width - 10;
+            }
+            // Adjust if tooltip would go off bottom
+            if (top + tooltipRect.height > window.innerHeight - 10) {
+                top = e.clientY - tooltipRect.height - 10;
+            }
+            
+            tooltip.style.left = left + 'px';
+            tooltip.style.top = top + 'px';
         }
 
         function moveTooltip(e) {
-            const tooltip = document.getElementById('flameTooltip');
-            tooltip.style.left = (e.clientX + 10) + 'px';
-            tooltip.style.top = (e.clientY + 10) + 'px';
+            // Don't move while mouse is potentially heading to tooltip
+        }
+
+        function scheduleHideTooltip() {
+            // Give user time to move mouse to tooltip
+            tooltipHideTimeout = setTimeout(() => {
+                hideTooltip();
+            }, 150);
         }
 
         function hideTooltip() {
+            if (tooltipHideTimeout) {
+                clearTimeout(tooltipHideTimeout);
+                tooltipHideTimeout = null;
+            }
+            document.getElementById('flameTooltip').style.display = 'none';
+            currentTooltipNode = null;
+        }
+
+        // Keep tooltip visible when mouse is over it
+        document.getElementById('flameTooltip')?.addEventListener('mouseenter', () => {
+            if (tooltipHideTimeout) {
+                clearTimeout(tooltipHideTimeout);
+                tooltipHideTimeout = null;
+            }
+        });
+
+        document.getElementById('flameTooltip')?.addEventListener('mouseleave', () => {
+            hideTooltip();
+        });
+
+        function showTypeDetails(event) {
+            event.stopPropagation();
+            if (!currentTooltipNode || !currentTooltipNode.types) return;
+            
+            const node = currentTooltipNode;
+            const overlay = document.getElementById('typeModalOverlay');
+            const title = document.getElementById('typeModalTitle');
+            const content = document.getElementById('typeModalContent');
+            
+            title.textContent = 'Type Distribution: ' + node.name;
+            
+            // Calculate total for percentages
+            const totalSize = node.types.reduce((sum, t) => sum + t.size, 0);
+            const totalCount = node.types.reduce((sum, t) => sum + t.count, 0);
+            
+            let html = '';
+            for (const typeInfo of node.types) {
+                const sizePct = totalSize > 0 ? ((typeInfo.size / totalSize) * 100).toFixed(1) : '0.0';
+                const countPct = totalCount > 0 ? ((typeInfo.count / totalCount) * 100).toFixed(1) : '0.0';
+                html += \`
+                    <div class="type-item">
+                        <span class="type-name">\${escapeHtml(typeInfo.name)}</span>
+                        <span class="type-stats">\${typeInfo.count.toLocaleString()} (\${countPct}%) • \${formatBytes(typeInfo.size)} (\${sizePct}%)</span>
+                    </div>
+                \`;
+            }
+            
+            content.innerHTML = html;
+            overlay.classList.add('visible');
+            
+            // Hide the tooltip
             document.getElementById('flameTooltip').style.display = 'none';
         }
+
+        function closeTypeModal() {
+            document.getElementById('typeModalOverlay').classList.remove('visible');
+        }
+
+        // Close modal on overlay click
+        document.getElementById('typeModalOverlay')?.addEventListener('click', (e) => {
+            if (e.target.id === 'typeModalOverlay') {
+                closeTypeModal();
+            }
+        });
 
         function refresh() {
             vscode.postMessage({ command: 'refresh' });
@@ -931,8 +1475,16 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
 </html>`;
     }
 
-    private buildFlameGraphData(result: ParseResult | null): Array<{name: string; x: number; width: number; depth: number; samples: number}> {
-        if (!result || !result.stacks || result.stacks.size === 0 || !result.methodProfiles) {
+    private buildFlameGraphData(result: ParseResult | null, mode: 'cpu' | 'allocation'): Array<{name: string; x: number; width: number; depth: number; samples: number; size?: number; types?: Array<{name: string; count: number; size: number}>}> {
+        if (!result || !result.stacks || result.stacks.size === 0) {
+            return [];
+        }
+
+        // For CPU mode, we need methodProfiles; for allocation mode, we need allocationSamples
+        if (mode === 'cpu' && (!result.methodProfiles || result.methodProfiles.size === 0)) {
+            return [];
+        }
+        if (mode === 'allocation' && (!result.allocationSamples || result.allocationSamples.size === 0)) {
             return [];
         }
 
@@ -940,30 +1492,31 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
         interface FlameNode {
             name: string;
             samples: number;
+            size: bigint;
+            types: Map<string, { count: number; size: bigint }>;
             children: Map<string, FlameNode>;
         }
 
-        const root: FlameNode = { name: 'root', samples: 0, children: new Map() };
+        const root: FlameNode = { name: 'root', samples: 0, size: BigInt(0), types: new Map(), children: new Map() };
         
-        // Get method name for an address
-        const getMethodName = (addr: bigint): string => {
-            // Build sorted method list for binary search
-            const methodAddresses: Array<{ address: bigint, endAddress: bigint, name: string }> = [];
-            for (const method of result.methods.values()) {
-                if (method.methodStartAddress > 0) {
-                    const fullName = method.methodNamespace 
-                        ? `${method.methodNamespace}.${method.methodName}`
-                        : method.methodName || `Method_0x${method.methodStartAddress.toString(16)}`;
-                    methodAddresses.push({
-                        address: method.methodStartAddress,
-                        endAddress: method.methodStartAddress + BigInt(method.methodSize),
-                        name: fullName
-                    });
-                }
+        // Build sorted method list for binary search (once, not per address)
+        const methodAddresses: Array<{ address: bigint, endAddress: bigint, name: string }> = [];
+        for (const method of result.methods.values()) {
+            if (method.methodStartAddress > 0) {
+                const fullName = method.methodNamespace 
+                    ? `${method.methodNamespace}.${method.methodName}`
+                    : method.methodName || `Method_0x${method.methodStartAddress.toString(16)}`;
+                methodAddresses.push({
+                    address: method.methodStartAddress,
+                    endAddress: method.methodStartAddress + BigInt(method.methodSize),
+                    name: fullName
+                });
             }
-            methodAddresses.sort((a, b) => a.address < b.address ? -1 : a.address > b.address ? 1 : 0);
+        }
+        methodAddresses.sort((a, b) => a.address < b.address ? -1 : a.address > b.address ? 1 : 0);
 
-            // Binary search
+        // Get method name for an address using binary search
+        const getMethodName = (addr: bigint): string => {
             let left = 0, right = methodAddresses.length - 1;
             while (left <= right) {
                 const mid = Math.floor((left + right) / 2);
@@ -979,13 +1532,45 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             return `0x${addr.toString(16)}`;
         };
 
-        // Sample counts per stack (simplified - use 1 sample per unique stack)
-        for (const stack of result.stacks.values()) {
-            if (stack.addresses.length === 0) { continue; }
+        // Get the sample data based on mode
+        const sampleData: Map<number, { count: number; size: bigint; types?: Map<string, { count: number; size: bigint }> }> = new Map();
+        
+        if (mode === 'cpu') {
+            // For CPU, we need to reconstruct from stacks (simplified: 1 sample per stack)
+            for (const stack of result.stacks.values()) {
+                if (stack.addresses.length > 0) {
+                    sampleData.set(stack.stackId, { count: 1, size: BigInt(0) });
+                }
+            }
+        } else {
+            // For allocation, use the allocation samples
+            for (const [stackId, data] of result.allocationSamples) {
+                sampleData.set(stackId, { count: data.count, size: data.size, types: data.types });
+            }
+        }
+
+        // Build tree from stacks
+        for (const [stackId, data] of sampleData) {
+            const stack = result.stacks.get(stackId);
+            if (!stack || stack.addresses.length === 0) { continue; }
 
             // Build the path from bottom to top (reverse the stack)
             let current = root;
-            root.samples++;
+            root.samples += data.count;
+            root.size += data.size;
+            
+            // Merge types into root (for allocation mode)
+            if ('types' in data && data.types) {
+                for (const [typeName, typeData] of data.types) {
+                    const existing = root.types.get(typeName);
+                    if (existing) {
+                        existing.count += typeData.count;
+                        existing.size += typeData.size;
+                    } else {
+                        root.types.set(typeName, { count: typeData.count, size: typeData.size });
+                    }
+                }
+            }
 
             // Stacks are typically top-first, so reverse for flame graph (bottom-up)
             const reversedAddrs = [...stack.addresses].reverse();
@@ -993,20 +1578,49 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             for (const addr of reversedAddrs) {
                 const name = getMethodName(addr);
                 if (!current.children.has(name)) {
-                    current.children.set(name, { name, samples: 0, children: new Map() });
+                    current.children.set(name, { name, samples: 0, size: BigInt(0), types: new Map(), children: new Map() });
                 }
                 current = current.children.get(name)!;
-                current.samples++;
+                current.samples += data.count;
+                current.size += data.size;
+                
+                // Merge types (for allocation mode)
+                if ('types' in data && data.types) {
+                    for (const [typeName, typeData] of data.types) {
+                        const existing = current.types.get(typeName);
+                        if (existing) {
+                            existing.count += typeData.count;
+                            existing.size += typeData.size;
+                        } else {
+                            current.types.set(typeName, { count: typeData.count, size: typeData.size });
+                        }
+                    }
+                }
             }
         }
 
         // Flatten tree to array with positions
-        const nodes: Array<{name: string; x: number; width: number; depth: number; samples: number}> = [];
+        const nodes: Array<{name: string; x: number; width: number; depth: number; samples: number; size?: number; types?: Array<{name: string; count: number; size: number}>}> = [];
         const totalSamples = root.samples;
 
         const flatten = (node: FlameNode, x: number, width: number, depth: number) => {
             if (node.name !== 'root') {
-                nodes.push({ name: node.name, x, width, depth, samples: node.samples });
+                // Convert types Map to sorted array for JSON serialization
+                const typesArray = mode === 'allocation' && node.types.size > 0
+                    ? Array.from(node.types.entries())
+                        .map(([name, data]) => ({ name, count: data.count, size: Number(data.size) }))
+                        .sort((a, b) => b.size - a.size)
+                    : undefined;
+                    
+                nodes.push({ 
+                    name: node.name, 
+                    x, 
+                    width, 
+                    depth, 
+                    samples: node.samples,
+                    size: Number(node.size),
+                    types: typesArray
+                });
             }
 
             let childX = x;
@@ -1014,7 +1628,6 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
             const sortedChildren = Array.from(node.children.values()).sort((a, b) => b.samples - a.samples);
             
             for (const child of sortedChildren) {
-                const childWidth = (child.samples / totalSamples) * (node.name === 'root' ? 1 : width / (node.samples / totalSamples));
                 const actualWidth = (child.samples / totalSamples);
                 flatten(child, childX, actualWidth, depth + 1);
                 childX += actualWidth;
@@ -1023,6 +1636,73 @@ export class NetTraceEditorProvider implements vscode.CustomReadonlyEditorProvid
 
         flatten(root, 0, 1, -1);
         return nodes;
+    }
+
+    private buildTypeStackDistribution(result: ParseResult | null): Map<string, Array<{ stackId: number; count: number; size: number; frames: string[] }>> {
+        const distribution = new Map<string, Array<{ stackId: number; count: number; size: number; frames: string[] }>>();
+        
+        if (!result || !result.typeStackDistribution || result.typeStackDistribution.size === 0) {
+            return distribution;
+        }
+
+        // Build method address lookup for resolving stack frames
+        const methodAddresses: Array<{ address: bigint, endAddress: bigint, name: string }> = [];
+        for (const method of result.methods.values()) {
+            if (method.methodStartAddress > 0) {
+                const fullName = method.methodNamespace 
+                    ? `${method.methodNamespace}.${method.methodName}`
+                    : method.methodName || `Method_0x${method.methodStartAddress.toString(16)}`;
+                methodAddresses.push({
+                    address: method.methodStartAddress,
+                    endAddress: method.methodStartAddress + BigInt(method.methodSize),
+                    name: fullName
+                });
+            }
+        }
+        methodAddresses.sort((a, b) => a.address < b.address ? -1 : a.address > b.address ? 1 : 0);
+
+        const getMethodName = (addr: bigint): string => {
+            let left = 0, right = methodAddresses.length - 1;
+            while (left <= right) {
+                const mid = Math.floor((left + right) / 2);
+                const entry = methodAddresses[mid];
+                if (addr >= entry.address && addr < entry.endAddress) {
+                    return entry.name;
+                } else if (addr < entry.address) {
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
+                }
+            }
+            return `0x${addr.toString(16)}`;
+        };
+
+        // Build distribution for each type
+        for (const [typeName, stackMap] of result.typeStackDistribution) {
+            const stacks: Array<{ stackId: number; count: number; size: number; frames: string[] }> = [];
+            
+            for (const [stackId, data] of stackMap) {
+                const stack = result.stacks.get(stackId);
+                if (!stack) { continue; }
+                
+                // Resolve stack frames to method names
+                const frames = stack.addresses.map(addr => getMethodName(addr));
+                
+                stacks.push({
+                    stackId,
+                    count: data.count,
+                    size: Number(data.size),
+                    frames
+                });
+            }
+            
+            // Sort by size descending
+            stacks.sort((a, b) => b.size - a.size);
+            
+            distribution.set(typeName, stacks);
+        }
+
+        return distribution;
     }
 }
 

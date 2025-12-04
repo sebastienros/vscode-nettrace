@@ -53,6 +53,7 @@ if (result.allocations.size > 0) {
 
 console.log(`\nMethods: ${result.methods.size}`);
 console.log(`Method Profiles: ${result.methodProfiles.size}`);
+console.log(`Allocation Samples (stacks with allocations): ${result.allocationSamples.size}`);
 
 if (result.methodProfiles.size > 0) {
     // Sort by exclusive count descending

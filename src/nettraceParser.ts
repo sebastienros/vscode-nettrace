@@ -92,6 +92,8 @@ export interface ParseResult {
     methods: Map<bigint, MethodInfo>;       // methodId -> MethodInfo
     methodsByAddress: Map<bigint, MethodInfo>; // address range lookup
     methodProfiles: Map<string, MethodProfile>; // methodName -> profile
+    allocationSamples: Map<number, { count: number; size: bigint; types: Map<string, { count: number; size: bigint }> }>; // stackId -> allocation count/size/types
+    typeStackDistribution: Map<string, Map<number, { count: number; size: bigint }>>; // typeName -> stackId -> count/size
     errors: string[];
     debugInfo: {
         totalEvents: number;
@@ -390,6 +392,8 @@ export class NetTraceParser {
             methods: new Map(),
             methodsByAddress: new Map(),
             methodProfiles: new Map(),
+            allocationSamples: new Map(),
+            typeStackDistribution: new Map(),
             errors: [],
             debugInfo: {
                 totalEvents: 0,
@@ -1477,6 +1481,41 @@ export class NetTraceParser {
 
         allocInfo.count++;
         allocInfo.totalSize += size;
+        
+        // Track allocation samples by stack for flame graph
+        if (stackId > 0) {
+            const existing = result.allocationSamples.get(stackId);
+            if (existing) {
+                existing.count++;
+                existing.size += size;
+                // Track type distribution per stack
+                const typeInfo = existing.types.get(typeName);
+                if (typeInfo) {
+                    typeInfo.count++;
+                    typeInfo.size += size;
+                } else {
+                    existing.types.set(typeName, { count: 1, size });
+                }
+            } else {
+                const types = new Map<string, { count: number; size: bigint }>();
+                types.set(typeName, { count: 1, size });
+                result.allocationSamples.set(stackId, { count: 1, size, types });
+            }
+            
+            // Track stack distribution per type (reverse mapping for drill-down)
+            let typeStacks = result.typeStackDistribution.get(typeName);
+            if (!typeStacks) {
+                typeStacks = new Map();
+                result.typeStackDistribution.set(typeName, typeStacks);
+            }
+            const stackData = typeStacks.get(stackId);
+            if (stackData) {
+                stackData.count++;
+                stackData.size += size;
+            } else {
+                typeStacks.set(stackId, { count: 1, size });
+            }
+        }
         
         // Get stack trace if available
         let stackTrace: string[] | undefined;
